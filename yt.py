@@ -23,7 +23,7 @@ load_dotenv()
 
 #======================== Config ==========================================
 logging.basicConfig(format="%(asctime)s - %(message)s", level=logging.INFO)
-API_KEY = os.getenv("YOUTUBE_API_KEY", "AIzaSyC03Nmv4G02ag2MOo4xMWYx35vhQb4snrw")
+API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 # ============Setup HTTP session with retry mechanism
 session = Session()
@@ -331,4 +331,5 @@ if __name__ == "__main__":
                     usernames.append(username)
     
     # usernames = ["patoranking", "wizkidayo"]
+
     youtube_data(usernames)
