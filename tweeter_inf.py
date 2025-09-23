@@ -64,7 +64,7 @@ def user_data(username):
                 "tweets": []  # always included for consistency
             }
 
-            # ✅ Only fetch tweets if requested
+            #  Only fetch tweets if requested
             if fetch_tweets:
                 tweets_response = client.get_users_tweets(
                     user.id,
@@ -273,4 +273,5 @@ if __name__ == "__main__":
 #                 results.append({"username": uname, "error": str(e)})
 
 #     return results
+
 
