@@ -1,209 +1,276 @@
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-
+import requests
 import tweepy
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from functools import cache
+import duckdb
 import pandas as pd
+import psycopg2
+from .inst import remove_emojis
+from .database import connect_to_database
 import os
 import time
-from datetime import datetime, timedelta
-
-from playwright.sync_api import sync_playwright
-
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
 
-#=====================Config====================#
+#============================== Config =====================================
+logging.getLogger().setLevel(logging.INFO)
 bearer_token = os.getenv("x_bearer_token")
 client = tweepy.Client(bearer_token=bearer_token, wait_on_rate_limit=True)
+#=============================================================================
 
-start_time = (datetime.utcnow() - timedelta(days=7)).isoformat(timespec="milliseconds") + "Z"
-end_time = datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+def user_data(username):
+    """
+    Fetch user profile (and optionally tweets) from Twitter API.
 
-min_followers=50000
+    Args:
+        client: Tweepy client
+        username (str): Twitter username
+        fetch_tweets (bool): If True, also fetch recent tweets
+
+    Returns:
+        dict: user data
+    """
+    while True:
+        try:
+            # Get profile info
+            users_response = client.get_users(
+                usernames=[username],
+                user_fields=[
+                    "id", "name", "username", "description", 
+                    "public_metrics", "created_at", "verified", "location"
+                ],
+                expansions=["pinned_tweet_id"]
+            )
+            if not users_response.data:
+                logging.warning(f"No user data found for {username}")
+                return None
+
+            user = users_response.data[0]
+            user_data = {
+                "id": user.id,
+                "name": user.name,
+                "username": user.username,
+                "description": user.description,
+                "followers_count": user.public_metrics["followers_count"],
+                "following_count": user.public_metrics["following_count"],
+                "tweet_count": user.public_metrics["tweet_count"],
+                "listed_count": user.public_metrics["listed_count"],
+                "created_at": str(user.created_at),
+                "verified": user.verified,
+                "location": user.location,
+                "tweets": []  # always included for consistency
+            }
+
+            # ✅ Only fetch tweets if requested
+            if fetch_tweets:
+                tweets_response = client.get_users_tweets(
+                    user.id,
+                    max_results=5,
+                    tweet_fields=["created_at", "public_metrics", "text"]
+                )
+                if tweets_response.data:
+                    user_data["tweets"] = [
+                        {
+                            "id": tweet.id,
+                            "text": tweet.text,
+                            "created_at": str(tweet.created_at),
+                            "retweet_count": tweet.public_metrics["retweet_count"],
+                            "reply_count": tweet.public_metrics["reply_count"],
+                            "like_count": tweet.public_metrics["like_count"],
+                            "quote_count": tweet.public_metrics["quote_count"],
+                        }
+                        for tweet in tweets_response.data
+                    ]
+
+            return user_data
+
+        except tweepy.TooManyRequests as e:
+            # Smarter backoff
+            reset_time = int(e.response.headers.get("x-rate-limit-reset", time.time() + 900))
+            sleep_for = max(reset_time - int(time.time()), 60)
+            logging.warning(f"Rate limit hit. Sleeping {sleep_for}s...")
+            time.sleep(sleep_for)
+            continue
+        except Exception as e:
+            logging.error(f"Unexpected error fetching data for {username}: {e}")
+            return None
 
 
-keywords = [
-    "influencer", "fashion", "blogger", "model", "photography", "style", "beauty", "lifestyle", "makeup", "travel",
-    "fitness", "motivation", "entrepreneur", "digital", "creator", "content", "marketing", "branding", "coach",
-    "artist", "music", "love", "wellness", "inspiration"
-    ]
+def x_data(username):
+    logging.info(f"getting data for @{username}")
+    data = user_data(username)
 
-def scrape_twitter_usernames(keyword, max_pages=5):
-    usernames = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        query = f'site:twitter.com "{keyword}"'
-        page.goto(f"https://www.google.com/search?q={query}")
-        
-        for _ in range(max_pages):
-            links = page.locator("a:has-text('twitter.com')").all()
-            for link in links:
-                href = link.get_attribute("href")
-                if href and "twitter.com/" in href:
-                    user = href.split("twitter.com/")[1].split("/")[0].split("?")[0]
-                    if user and user.lower() != "home":
-                        usernames.append(user)
-            try:
-                next_button = page.locator("a#pnnext")
-                if next_button.is_visible():
-                    next_button.click()
-                    time.sleep(2)
-                else:
-                    break
-            except Exception:
-                break
-        browser.close()
-    return list(set(usernames))
+    if not data:
+        logging.warning(f"No data for {username}")
+        return
 
-def get_userdata(username):
-    try:
-        profile = client.get_user(username=username, user_fields=["id", "username", "description", "public_metrics"])
-        user = profile.data
-        follower_count = user.public_metrics["followers_count"]
+    columns = ["created_at",
+               "username", "id", "bio", "location", "profile_image_url", 
+               "followers", "is_verified", "published_at", "text", 
+               "likes", "retweets", "comments_count"]             
+    df = pd.DataFrame(data)
+    column = [col for col in columns if col in df.columns]
+    df = df[column]
+    duck = duckdb.connect()
+    duck.register("df", df)
+    #====================== Type Casting and Data cleansing ===========================
+    df['username'] = df["username"].astype(str).apply(remove_emojis)
+    df['id'] = df["id"].astype(str)
+    df['bio'] = df["bio"].astype(str).apply(remove_emojis).replace(r'[@#"/]', ' ', regex=True)
+    df['location'] = df["location"].astype(str)
+    df['profile_image_url'] = df["profile_image_url"].astype(str)
+    df['followers'] = df["followers"].fillna(0).astype(int)
+    df['is_verified'] = df['is_verified'].astype(bool)
+    df['created_at'] = pd.to_datetime(df['created_at'], errors="coerce")
+    df['published_at'] = pd.to_datetime(df['published_at'], errors="coerce")
+    df['text'] = df["text"].astype(str).apply(remove_emojis).replace(r'[@#"/]', ' ', regex=True)
+    df['likes'] = df['likes'].astype(int)
+    df['retweets'] = df['retweets'].astype(int)
+    df['comments_count'] = df['comments_count'].astype(int)
+    df_clean = duck.execute("""
+                    SELECT created_at, username, id, 
+                        REPLACE(bio, '|', ' ') AS bio, 
+                        location, profile_image_url, 
+                        followers, is_verified, 
+                        published_at, 
+                        REPLACE(text, '|', ' ') AS text, 
+                        likes, retweets, comments_count 
+                    FROM df
+                """).fetchdf()
 
-        if follower_count < min_followers:
-            return []
+    records = df_clean.to_records(index=False)
+    query = f"""
+                INSERT INTO influencer_x({', '.join(columns)})
+                VALUES ({', '.join(['%s'] * len(columns))})
+                
+                ON CONFLICT (id)  
+                DO UPDATE SET
+                    created_at = EXCLUDED.created_at,
+                    username = EXCLUDED.username,
+                    bio = EXCLUDED.bio,
+                    location = EXCLUDED.location,
+                    profile_image_url = EXCLUDED.profile_image_url,
+                    followers = EXCLUDED.followers,
+                    is_verified = EXCLUDED.is_verified,
+                    published_at = EXCLUDED.published_at,
+                    text = EXCLUDED.text,
+                    likes = EXCLUDED.likes,
+                    retweets = EXCLUDED.retweets,
+                    comments_count = EXCLUDED.comments_count"""
 
-        tweets = client.get_users_tweets(
-            id=user.id,
-            tweet_fields=["id", "created_at", "text", "public_metrics"],
-            max_results=5,
-            start_time=start_time,
-            end_time=end_time
-        )
+    engine = connect_to_database()
+    if engine:
+        try:
+            with engine.cursor() as cursor:
+                cursor.execute("SET sceham_path TO PUBLIC") 
+                engine.commit() 
 
-        user_tweets = []
-        if tweets.data:
-            for tweet in tweets.data:
-                user_tweets.append({
-                    "user_id": user.id,
-                    "username": user.username,
-                    "bio": user.description,
-                    "followers": follower_count,
-                    "text": tweet.text,
-                    "created_at": tweet.created_at,
-                    "likes": tweet.public_metrics["like_count"],
-                    "retweets": tweet.public_metrics["retweet_count"]
-                })
-        return user_tweets
-    except Exception as e:
-        print(f"Failed to fetch data for @{username}: {e}")
-        return []
+                cursor.execute("""CREATE TABLE IF NOT EXISTS influencer_x(created_at TIMESTAMP,
+                            username Text, id Varchar(50) PRIMARY KEY, bio Text, location Text, profile_image_url Text, 
+                            followers INT, is_verified Boolean, published_at TIMESTAMP, text Text, likes INT, retweets INT, comments_count INT)"""
+                            )  
+                engine.commit()
 
-def tweeter_influencers(**context):
-    all_data = []
-    seen_usernames = set()
+                cursor.executemany(query, records)
+                engine.commit()
+        except psycopg2.DatabaseError as e:
+            engine.rollback()
+        finally:
+            if cursor:
+                cursor.close()
+            if engine:
+                engine.close()
 
-    for keyword in keywords:
-        usernames = scrape_twitter_usernames(keyword)
 
-        for username in usernames:
-            if username in seen_usernames:
-                continue
-            seen_usernames.add(username)
-
-            user_data = get_userdata(username)
-            if user_data:
-                all_data.extend(user_data)
-            time.sleep(1) 
-
-    if all_data:
-        df = pd.DataFrame(all_data)
-    data = df.to_json(orient='records')
-    df_json = context['ti'].xcom_push(key='raw_df', value='data')
-    return df_json
+#Test 
+if __name__ == "__main__":
+    usernames = "DONJAZZY"
     
-
-
-def stage_to_sqlite_task(**context):
-    df_json = context['ti'].xcom_pull(key='raw_df')
-    df = pd.read_json(df_json, orient='records')
-    conn = sqlite3.connect('influencers.db')
-    df.to_sql('staging', conn, if_exists='replace', index=False)
-    conn.close()
-    
-def filter_keywords_from_bio(text, keywords):
-    text = text.encode('ascii', 'ignore').decode() 
-    words = re.findall(r'\b\w+\b', text.lower())    
-    return ' '.join([word for word in words if word in keywords])
-
-def transform_data(**context):
-    conn = sqlite3.connect('/tmp/influencers.db')
-    df = pd.read_sql_query("SELECT * FROM staging", conn)
-    df.drop(df['user_id'], inplace=True, axis=1)
-
-    df["bio"] = df["bio"].apply(lambda x: filter_keywords_from_bio(x, keywords))
-
-    df.to_sql('transformed', conn, if_exists='replace', index=False)
-    context['ti'].xcom_push(key='transformed_df', value=df.to_json(orient='records'))
-    conn.close()
-
-def load_to_mysql_task(**context):
-    df_json = context['ti'].xcom_pull(key='transformed_df')
-    df = pd.read_json(df_json, orient='records')
-
-    engine = create_engine('mysql+pymysql://user:Mysql@localhost:3306/influencer')
-    df.to_sql('instagram_influencers', con=engine, if_exists='replace', index=False)
-
-def export_to_powerbi_task(**context):
-    df_json = context['ti'].xcom_pull(key='transformed_df')
-    df = pd.read_json(df_json, orient='records')
-
-    
-    df.to_csv('/tmp/influencers_for_powerbi.csv', index=False)
-    
+    x_data(usernames)
 
 
 
-with DAG(
-    'influencer_dashboard_Instagram',
-    default_args=default_args,
-    schedule_interval=timedelta(days=1),
-    catchup=False,
-    ) as dag:
-    
+# def user_data(usernames):
+#     results = []
+#     # max 100 usernames per call
+#     chunk_size = 2
 
+#     for i in range(0, len(usernames), chunk_size):
+#         chunk = usernames[i:i + chunk_size]
+#         try:
+            
+#             users_response = client.get_users(
+#                 usernames=chunk,
+#                 user_fields=["created_at", "description", "location",
+#                              "profile_image_url", "public_metrics",
+#                              "verified", "is_identity_verified"]
+#             )
 
-    extract = PythonOperator(
-        task_id='extract_profiles',
-        python_callable=tweeter_influencers,
-        provide_context=True
-        retries=4,
-        retry_delay=timedelta(minutes=5),
-        priority_weight=4,
-        dag=dag
-        )
-    
-    
+#             if not users_response.data:
+#                 logging.warning(f"No user data returned for {chunk}")
+#                 continue
 
-    stage = PythonOperator(
-    task_id='stage_to_sqlite',
-    python_callable=stage_to_sqlite_task,
-    provide_context=True,
-    priority_weight=3,
-    dag=dag
-    )
-       
-    transform = PythonOperator(
-        task_id='transform_data',
-        python_callable=transform_data,
-        provide_context=True,
-        priority_weight=2,
-        dag=dag
-        )
+#             for user in users_response.data:
+#                 try:
+#                     #=========== Parsing Json response ======================
+#                     created = user.created_at
+#                     user_id = user.id
+#                     username = user.username
+#                     bio = user.description or ""
+#                     location = user.location or ""
+#                     profile_image_url = user.profile_image_url or ""
+#                     followers = user.public_metrics.get("followers_count", 0)
+#                     is_verified = user.verified
 
-    load_mysql = PythonOperator(
-        task_id='load_mysql',
-        python_callable=load_to_mysql,
-        provide_context=True,
-        dag=dag
-        )
+                    
+#                     tweets = client.get_users_tweets(
+#                         user_id,
+#                         max_results=5,
+#                         tweet_fields=["created_at", "public_metrics", "text"]
+#                     )
 
-    refresh_powerbi = PythonOperator(
-        task_id='refresh_powerbi',
-        python_callable=load_powerbi_refresh
-        )
+#                     published_at, tweet_text, tweets_likes, tweets_retweets, tweets_comments = [], [], [], [], []
+#                     if tweets.data:
+#                         for tweet in tweets.data:
+#                             published_at.append(tweet.created_at)
+#                             tweet_text.append(tweet.text)
+#                             tweets_likes.append(tweet.public_metrics.get("like_count", 0))
+#                             tweets_retweets.append(tweet.public_metrics.get("retweet_count", 0))
+#                             tweets_comments.append(tweet.public_metrics.get("reply_count", 0))
 
-extract >> stage>> transform >> [load_mysql, refresh_powerbi]
+#                     # ================ Data  Mapping ==========================
+#                     user_info = {
+#                         "created_at": created,
+#                         "username": username,
+#                         "id": str(user_id),
+#                         "bio": bio,
+#                         "location": location,
+#                         "profile_image_url": profile_image_url,
+#                         "followers": followers,
+#                         "is_verified": is_verified,
+#                         "published_at": published_at,
+#                         "text": tweet_text,
+#                         "likes": tweets_likes,
+#                         "retweets": tweets_retweets,
+#                         "comments_count": tweets_comments
+#                     }
+#                     results.append(user_info)
+
+#                 except Exception as e:
+#                     logging.error(f"Error processing user {user.username}: {e}")
+#                     results.append({"username": user.username, "error": str(e)})
+
+#         except tweepy.TooManyRequests as e:
+#             logging.warning("Rate limit hit. Waiting...")
+#             time.sleep(900)
+#             continue
+#         except Exception as e:
+#             logging.error(f"Error fetching chunk {chunk}: {e}")
+#             for uname in chunk:
+#                 results.append({"username": uname, "error": str(e)})
+
+#     return results
+
